@@ -1,3 +1,37 @@
+# === NEW: 兼容性导入 / 兜底 =================================================
+try:
+    # 4.53 及以后
+    from transformers.utils import is_torchdynamo_compiling
+except ImportError:
+    try:
+        # 4.28 – 4.52 在 generation.utils 里
+        from transformers.generation.utils import is_torchdynamo_compiling
+    except ImportError:
+        # 再老的版本根本没有这个函数——直接返回 False
+        def is_torchdynamo_compiling() -> bool:      # type: ignore
+            return False
+# ============================================================================
+
+import inspect as _insp
+
+def _safe_validate_assistant(model, assistant_model,
+                             tokenizer=None, assistant_tokenizer=None):
+    """
+    兼容 transformers ≤4.52 旧签名  和 ≥4.53 新签名
+    """
+    if not hasattr(model, "_validate_assistant"):
+        return
+    sig = _insp.signature(model._validate_assistant)
+    if len(sig.parameters) == 1:                       # 旧版本，只要 1 个参数
+        model._validate_assistant(assistant_model)
+    else:                                              # 新版本，需要 3~4 个参数
+        model._validate_assistant(
+            assistant_model,
+            tokenizer=tokenizer,
+            assistant_tokenizer=assistant_tokenizer,
+        )
+
+
 import inspect
 import warnings
 from typing import Callable, List, Optional, Union
@@ -543,7 +577,7 @@ def create_mapping_matrix(mapping, union_vocab_size, model_vocab_size):
     # Create a sparse tensor
     size = torch.Size([model_vocab_size, union_vocab_size])
     mapping_matrix = torch.sparse_coo_tensor(indices, values, size, device="cuda")
-
+   # mapping_matrix = mapping_matrix.half()  
     return mapping_matrix
 
 
@@ -690,10 +724,14 @@ def merge_and_convert_tokens(
     if need_ensemble:
         for output, mapping_matrix in zip(outputs, mapping_matrices):
             # Evert outputs of all models will be mapped
+            if output.dtype != mapping_matrix.dtype:          # ← 新增
+                output = output.to(mapping_matrix.dtype)  
             transformed_probs = torch.sparse.mm(output, mapping_matrix)
             merged_probs += transformed_probs
     else:
         # Only process the output at the primary_index
+        if output.dtype != mapping_matrix.dtype:          # ← 新增
+           output = output.to(mapping_matrix.dtype)  
         transformed_probs = torch.sparse.mm(
             outputs[primary_index], mapping_matrices[primary_index]
         )
@@ -1065,7 +1103,46 @@ def greedy_search(
     #         else None
     #     )
 
-    model_kwargs = model._get_initial_cache_position(input_ids, model_kwargs)
+    # model_kwargs = model._get_initial_cache_position(input_ids, model_kwargs)
+    # ---------- 调 _get_initial_cache_position，兼容所有版本 ----------
+    cache_pos_fn = model._get_initial_cache_position
+    sig          = inspect.signature(cache_pos_fn)
+    
+    # 取得完整形参列表；若首个不是 self 就别裁掉
+    all_params   = list(sig.parameters.keys())
+    if all_params and all_params[0] == "self":
+        pnames = all_params[1:]
+    else:
+        pnames = all_params
+    
+    try:
+        # ① ≥4.55：首参是 seq_length / length / position_ids（纯 int）
+        if pnames and pnames[0] in {"seq_length", "length", "position_ids"}:
+            model_kwargs = cache_pos_fn(
+                input_ids.shape[-1],
+                device=input_ids.device,
+                model_kwargs=model_kwargs,
+            )
+        # ② 4.55-4.56：input_ids, device, model_kwargs
+        elif len(pnames) >= 3 and pnames[1] == "device":
+            model_kwargs = cache_pos_fn(
+                input_ids,
+                device=input_ids.device,
+                model_kwargs=model_kwargs,
+            )
+        # ③ 4.53-4.54 或 ≤4.52：input_ids, model_kwargs
+        elif "model_kwargs" in pnames:
+            model_kwargs = cache_pos_fn(input_ids, model_kwargs)
+        # ④ 极老版：只有 input_ids
+        else:
+            model_kwargs = cache_pos_fn(input_ids)
+    except TypeError:
+        # 保险兜底 —— 尝试最常见的两种调用
+        try:
+            model_kwargs = cache_pos_fn(input_ids, model_kwargs)
+        except TypeError:
+            model_kwargs = cache_pos_fn(input_ids)
+    # -----------------------------------------------------------------
     if model.config.is_encoder_decoder:
         raise Exception("We only support decorder arch!")
 
@@ -1164,15 +1241,30 @@ def generate_prepare(
 ) -> Union[GenerateOutput, torch.LongTensor]:
 
     # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
-    model._validate_model_class()
-    tokenizer = kwargs.pop(
-        "tokenizer", None
-    )  # Pull this out first, we only use it for stopping criteria
+    # -----------------------------------------------------------------------
+    # 统一走我们封装的 _safe_validate_assistant()，它会自动适配
+    # transformers ≤4.52（1 参数）和 ≥4.53（4 参数）两种签名，
+    # 避免重复调用造成 TypeError
+    tokenizer_in_kwargs = kwargs.get("tokenizer")
+    assistant_tokenizer_in_kwargs = kwargs.get("assistant_tokenizer")
+
+    _safe_validate_assistant(
+        model,
+        assistant_model,
+        tokenizer=tokenizer_in_kwargs,
+        assistant_tokenizer=assistant_tokenizer_in_kwargs,
+    )
+    # -----------------------------------------------------------------------
+
+    # 之后再取出 tokenizer（只给 stopping_criteria 用）
+    tokenizer = kwargs.pop("tokenizer", None)
+
     generation_config, model_kwargs = model._prepare_generation_config(
         generation_config, **kwargs
     )
     model._validate_model_kwargs(model_kwargs.copy())
-    model._validate_assistant(assistant_model)
+
+    # model._validate_assistant(assistant_model)
 
     # 2. Set generation parameters if not already defined
     if synced_gpus is None:

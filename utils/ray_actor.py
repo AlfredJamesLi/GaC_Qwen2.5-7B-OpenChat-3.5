@@ -1,6 +1,17 @@
-import inspect
-import os
-import time
+import inspect              # ← dispatch_model 还要用到
+import os, time
+# ---- GaC monkey-patch: allow pp_style = None / colwise / rowwise ----------
+from transformers import modeling_utils as _mu
+
+# ⚠️ _mu.ALL_PARALLEL_STYLES 可能是 None（尚未初始化）
+if _mu.ALL_PARALLEL_STYLES is None:
+    _mu.ALL_PARALLEL_STYLES = []
+
+# 转成 set 避免重复，再统一写回去
+_mu.ALL_PARALLEL_STYLES = list(
+    set(_mu.ALL_PARALLEL_STYLES) | {None, "colwise", "rowwise"}
+)
+# --------------------------------------------------------------------------
 
 import ray
 import torch
@@ -26,6 +37,10 @@ class ModelGenerator:
         use_cache=True,
         quantization="none",
     ):
+       # ------- 先保存实例属性 -------
+        self.model_name = model_name
+        self.model_ensemble_weight = model_ensemble_weight
+        self.use_cache = use_cache
 
         quantization_options = {
             "8bit": BitsAndBytesConfig(load_in_8bit=True),
@@ -48,24 +63,46 @@ class ModelGenerator:
             trust_remote_code=True,
             quantization_config=quantization_config,
         )
+        # === 量化判定：只有非量化模型才需要切分 ===
+        need_dispatch = quantization == "none"
+        if need_dispatch:
+            # FP16 / FP32 才需要切分到多 GPU
+            device_map = infer_auto_device_map(
+                model,
+                max_memory=max_memory,
+                no_split_module_classes=model._get_no_split_modules("auto"),
+            )
+            device_map_kwargs = {"device_map": device_map}
+            if "skip_keys" in inspect.signature(dispatch_model).parameters:
+                device_map_kwargs["skip_keys"] = model._skip_keys_device_placement
+            self.model = dispatch_model(model, **device_map_kwargs)
+        else:
+            # 4bit / 8bit 已经在目标设备
+            self.model = model
 
-        device_map = infer_auto_device_map(
-            model,
-            max_memory=max_memory,
-            no_split_module_classes=model._get_no_split_modules("auto"),
-        )
+                    
+        #################旧代码##
+
+      #  device_map = infer_auto_device_map(
+     #       model,
+      #      max_memory=max_memory,
+     #       no_split_module_classes=model._get_no_split_modules("auto"),
+      #  )
 
         # https://github.com/huggingface/transformers/blob/v4.36.2/src/transformers/modeling_utils.py#L3773
-        device_map_kwargs = {"device_map": device_map}
-        if "skip_keys" in inspect.signature(dispatch_model).parameters:
-            device_map_kwargs["skip_keys"] = model._skip_keys_device_placement
+      #  device_map_kwargs = {"device_map": device_map}
+    #    if "skip_keys" in inspect.signature(dispatch_model).parameters:
+     #       device_map_kwargs["skip_keys"] = model._skip_keys_device_placement
 
-        self.model_name = model_name
-        self.model_ensemble_weight = model_ensemble_weight
-        self.use_cache = use_cache
+     #   self.model_name = model_name
+      #  self.model_ensemble_weight = model_ensemble_weight
+    #    self.use_cache = use_cache
 
         # Load model to GPU
-        self.model = dispatch_model(model, **device_map_kwargs)
+     #   self.model = dispatch_model(model, **device_map_kwargs)
+        
+        #################################
+        
         if self.model_name in ["Yi-34B-Chat", "Yi-6B-Chat"]:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 model_path, padding_side="left", use_fast=False, trust_remote_code=True
