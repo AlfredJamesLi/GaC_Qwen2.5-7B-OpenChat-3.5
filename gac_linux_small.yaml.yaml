@@ -1,0 +1,22 @@
+# configs/gac_linux.yaml
+NORM_TYPE_API_SERVER: "score"      # 根据 score 加权
+THRESHOLD_API_SERVER: 0.96         # <0.96 时才走辅模型
+
+CONFIG_API_SERVER:
+  # ──────────────────────────────────────────
+  - weight: "/data/models/Mistral-7B"        # 本地 model 路径或 HF 名
+    name: "Mistral-7B-Instruct-v0.1"
+    num_gpus: 1                              # 独占 GPU-0
+    max_memory: {0: "70GiB"}                 # A100-80G 预留 10 GiB
+    priority: "primary"                      # 主模型
+    quantization: "none"                     # 全精度
+    score: 100                               # 验证集得分
+
+  # ──────────────────────────────────────────
+  - weight: "/data/models/OpenChat-3.5"
+    name: "OpenChat-3.5-0106"
+    num_gpus: 1                              # 独占 GPU-1
+    max_memory: {1: "70GiB"}
+    priority: "supportive"                   # 辅助投票
+    quantization: "4bit"                     # 显存再省一点
+    score: 98

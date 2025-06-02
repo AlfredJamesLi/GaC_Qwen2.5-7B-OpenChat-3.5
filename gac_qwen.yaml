@@ -1,0 +1,26 @@
+---
+NORM_TYPE_API_SERVER: "average"
+THRESHOLD_API_SERVER: 1.0  # 全部投票
+
+CONFIG_API_SERVER:
+  # ---------- Qwen2.5 主模型 ----------
+  - weight: "hf_cache/Qwen2.5-7B"      # 指向含 config.json 的目录
+    name: "Qwen2.5-7B-Instruct"
+    num_gpus: 0.5
+    max_memory: {0: "12GiB"}
+    priority: "supportive"
+    quantization: "4bit"
+    trust_remote_code: true
+    use_flash_attention_2: false       # 关闭 Flash-Attn
+    score: 100
+
+  # ---------- OpenChat 备用模型 ----------
+  - weight: "hf_cache/OpenChat-3.5"
+    name: "OpenChat-3.5-0106"
+    num_gpus: 0.5
+    max_memory: {0: "12GiB"}
+    priority: "supportive"
+    quantization: "4bit"
+    trust_remote_code: true
+    use_flash_attention_2: false       # 同样关闭
+    score: 100
